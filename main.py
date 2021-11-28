@@ -1,17 +1,30 @@
-from telegram.ext import Updater, CommandHandler, CallbackContext, ConversationHandler, CallbackQueryHandler, MessageHandler, Filters
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    CallbackContext,
+    ConversationHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    Filters,
+)
 from telegram import Update, ReplyKeyboardMarkup
 import requests
 import re
 import json
 import websocket
-from threading import Thread
-#(venv) D:\HK2_2020-2021\Internet of Things\telegram\telegram>pip install python-telegram-bot
-#(venv) D:\HK2_2020-2021\Internet of Things\telegram\telegram>pip install websocket-client
+from threading import Thread, Event
+import time
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
 class WioSensor:
     def __init__(self, base_url, token):
         self.base_url = base_url
         self.token = token
-    
+
     def postData(self, url):
         contents = requests.post(url).json()
         return contents
@@ -20,6 +33,7 @@ class WioSensor:
         contents = requests.get(url).json()
         return contents
 
+
 class WioRelay(WioSensor):
     def __init__(self, base_url, token):
         WioSensor.__init__(self, base_url, token)
@@ -27,7 +41,7 @@ class WioRelay(WioSensor):
     def getStatus(self):
         url = self.base_url + "/onoff_status?access_token=" + self.token
         return self.getData(url)
-	
+
     def setOn(self):
         url = self.base_url + "/onoff/1?access_token=" + self.token
         return self.postData(url)
@@ -48,6 +62,7 @@ class WioRelay(WioSensor):
         contents = self.setOff()
         update.message.reply_text(json.dumps(contents))
 
+
 class WioTemp(WioSensor):
     def __init__(self, base_url, token):
         WioSensor.__init__(self, base_url, token)
@@ -58,31 +73,54 @@ class WioTemp(WioSensor):
 
     def getTempCallback(self, update: Update, context: CallbackContext):
         contents = self.getTemp()
-        update.message.reply_text("Hiện tại nhiệt độ là " + str(contents['temperature'] + " độ"))
+        update.message.reply_text(
+            "Hiện tại nhiệt độ là " + str(contents["temperature"]) + " độ"
+        )
+
 
 class WioPIR(WioSensor):
     def __init__(self, base_url, token):
         WioSensor.__init__(self, base_url, token)
         self.warn_id_list = {}
-        ws_run = Thread(target=self.initWebsocket)
-        ws_run.start()
-    
+        self.ws_thread = Thread(target=self.initWebsocket)
+        self.ws_thread.start()
+        self.event = Event()
+        self.action_thread = Thread(target=self.actionThread)
+        self.action_thread.start()
+        self.actionFunc = None
+        self.actionEndFunc = None
+
     def initWebsocket(self):
-        self.ws = websocket.WebSocketApp('wss://us.wio.seeed.io/v1/node/event', on_open=self.socOnOpen, on_message=self.socOnMessage)
+        self.ws = websocket.WebSocketApp(
+            "wss://us.wio.seeed.io/v1/node/event",
+            on_open=self.socOnOpen,
+            on_message=self.socOnMessage,
+        )
         self.ws.run_forever()
 
     def socOnOpen(self, ws):
-        print ("socket open")
         self.ws.send(self.token)
-        print ("socket sent")
 
     def socOnMessage(self, ws, message):
-        print ("kich hoat")
+        print("kich hoat")
         for id in self.warn_id_list:
-            self.warn_id_list[id].bot.send_message(id, "BÁO ĐỘNG: có gì đó kích hoạt PIR") 
-        if self.action is not None:
+            self.warn_id_list[id].bot.send_message(
+                id, "BÁO ĐỘNG: có gì đó kích hoạt PIR"
+            )
+        if self.actionFunc is not None:
             print("vo action")
-            print(self.action())
+            self.actionFunc()
+            self.event.set()
+
+    def actionThread(self):
+        while 1:
+            event_is_set = self.event.wait()
+            while self.getApproach()["approach"]:
+                print("************ok")
+                time.sleep(10)
+                self.event.clear()
+            self.actionEndFunc()
+
 
     def addWarnIdList(self, ID, context):
         self.warn_id_list[ID] = context
@@ -90,9 +128,10 @@ class WioPIR(WioSensor):
     def removeWarnIdList(self, ID, context):
         self.warn_id_list.pop(ID, None)
 
-    def configCallback (self, update: Update, context: CallbackContext):
+    def configCallback(self, update: Update, context: CallbackContext):
+        global relay
         text = update.message.text
-        #kích hoạt báo động
+        # kích hoạt báo động
         if text == reply_keyboard[0][0]:
             self.addWarnIdList(update.message.chat.id, context)
             update.message.reply_text("đã kích hoạt báo động")
@@ -102,13 +141,14 @@ class WioPIR(WioSensor):
             update.message.reply_text("đã hủy báo động")
         # kích hoạt quạt
         elif text == reply_keyboard[1][0]:
-            self.action = relay.setOn
-            self.actionEnd = relay.setOff
+            self.actionFunc = relay.setOn
+            self.actionEndFunc = relay.setOff
             update.message.reply_text("quạt sẽ được mở khi PIR được kích hoạt")
         # Hủy kích hoạt quạt
         elif text == reply_keyboard[1][1]:
-            del self.action
-            del self.action
+            if self.actionFunc is not None:
+                del self.actionFunc
+            #del self.actionEndFunc
             update.message.reply_text("đã hủy kích hoạt quạt")
         return ConversationHandler.END
 
@@ -120,52 +160,68 @@ class WioPIR(WioSensor):
         contents = self.getApproach()
         update.message.reply_text(json.dumps(contents))
 
+
 WARN_ON, WARN_OFF, FAN_ON, END = range(4)
 CHOOSING = range(1)
 
 reply_keyboard = [
-    ['kích hoạt báo động', 'Hủy báo động'],
-    ['kích hoạt quạt', 'Hủy kích hoạt quạt'],
-    ['Hủy'],
+    ["kích hoạt báo động", "Hủy báo động"],
+    ["kích hoạt quạt", "Hủy kích hoạt quạt"],
+    ["Hủy"],
 ]
 markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
-relay = WioRelay("https://us.wio.seeed.io/v1/node/GroveRelayD0", "8026ded5cb19d17056fb50bb09b7f8c3")
-temp = WioTemp("https://us.wio.seeed.io/v1/node/GroveTempA0", "8026ded5cb19d17056fb50bb09b7f8c3")
-pir = WioPIR("https://us.wio.seeed.io/v1/node/GrovePIRMotionD1", "8026ded5cb19d17056fb50bb09b7f8c3")
+relay = WioRelay(
+    "https://us.wio.seeed.io/v1/node/GroveRelayD0",
+    os.getenv("WIO_TOKEN"),
+)
+temp = WioTemp(
+    "https://us.wio.seeed.io/v1/node/GroveTempA0",
+    os.getenv("WIO_TOKEN"),
+)
+pir = WioPIR(
+    "https://us.wio.seeed.io/v1/node/GrovePIRMotionD1",
+    os.getenv("WIO_TOKEN"),
+)
+
 
 def pirConfig(update: Update, context: CallbackContext):
     update.message.reply_text(
-        "Hãy chọn tùy chỉnh bạn muốn thay đổi ",
-        reply_markup=markup
+        "Hãy chọn tùy chỉnh bạn muốn thay đổi ", reply_markup=markup
     )
     return CHOOSING
+
 
 def end(update: Update, context: CallbackContext):
     update.message.reply_text("cấu hình PIR kết thúc")
     return ConversationHandler.END
 
+
 def main():
-    updater = Updater('2121690799:AAFO70iwZ6Ic9S0NT_by2LQx9tGPRLD-NC0') #telegram bot token
+    updater = Updater(os.getenv("TELEGRAM_TOKEN"))
     dp = updater.dispatcher
-    dp.add_handler(CommandHandler('relay_on',relay.setOnCallback))
-    dp.add_handler(CommandHandler('relay_off',relay.setOffCallback))
-    dp.add_handler(CommandHandler('temp',temp.getTempCallback))
-    dp.add_handler(CommandHandler('pir',pir.getApproachCallback))
+    dp.add_handler(CommandHandler("relay_on", relay.setOnCallback))
+    dp.add_handler(CommandHandler("relay_off", relay.setOffCallback))
+    dp.add_handler(CommandHandler("temp", temp.getTempCallback))
+    dp.add_handler(CommandHandler("pir", pir.getApproachCallback))
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('pirconfig', pirConfig)],
+        entry_points=[CommandHandler("pirconfig", pirConfig)],
         states={
             CHOOSING: [
                 MessageHandler(
-                    Filters.regex('^(kích hoạt báo động|Hủy báo động|kích hoạt quạt|Hủy kích hoạt quạt|Hủy)$'), pir.configCallback
+                    Filters.regex(
+                        "^(kích hoạt báo động|Hủy báo động|kích hoạt quạt|Hủy kích hoạt quạt|Hủy)$"
+                    ),
+                    pir.configCallback,
                 ),
             ],
         },
-        fallbacks=[MessageHandler(Filters.regex('^Hủy$'), end)],
+        fallbacks=[MessageHandler(Filters.regex("^Hủy$"), end)],
     )
 
     dp.add_handler(conv_handler)
     updater.start_polling()
     updater.idle()
-    
-if __name__ == '__main__':
+
+
+if __name__ == "__main__":
     main()
